@@ -1,0 +1,212 @@
+
+## 标题：Browser-Use Agent 智能 DOM 映射机制
+
+---
+
+## 学习目标
+
+理解 Browser-Use 如何：
+1. 将网页 DOM 转换为 LLM 可读格式
+2. 让模型智能选择目标元素
+3. 安全执行用户动作
+
+---
+
+## 核心流程图
+
+### 阶段 1：DOM 抓取与增强树构建
+```
+┌─────────────────────────────────────────────┐
+│         页面加载 & CDP 连接                   │
+└─────────────┬───────────────────────────────┘
+              │
+              ▼
+┌─────────────────────────────────────────────┐
+│     DomService.get_dom_tree()               │
+│  • 抓取 HTML DOM                             │
+│  • 抓取 Accessibility Tree (AX)              │
+│  • 获取屏幕快照                              │
+└─────────────┬───────────────────────────────┘
+              │
+              ▼
+┌─────────────────────────────────────────────┐
+│    EnhancedDOMTree 构建                      │
+│  • 合并多源数据                              │
+│  • 建立元素层级关系                          │
+│  • 提取关键属性                              │
+└─────────────────────────────────────────────┘
+```
+
+### 阶段 2：智能序列化与索引分配
+```
+┌─────────────────────────────────────────────┐
+│     serialize_accessible_elements()         │
+├─────────────────────────────────────────────┤
+│  1. _create_simplified_tree()                │
+│     └─ 压缩 DOM 层级，减少冗余                │
+│                                            │
+│  2. paint-order 过滤                         │
+│     └─ 移除被遮挡的不可见元素                │
+│                                            │
+│  3. bounding-box 优化                        │
+│     └─ 移除视口外的元素                      │
+│                                            │
+│  4. ClickableElementDetector 判定            │
+│     ├─ JS click listener 检测                │
+│     ├─ aria roles 检测                       │
+│     └─ 表单控件包裹检测                      │
+│                                            │
+│  5. _assign_interactive_indices()            │
+│     └─ 生成 selector_map (key: index)        │
+└─────────────────────────────────────────────┘
+```
+
+### 阶段 3：LLM 交互决策
+```
+┌─────────────────────────────────────────────┐
+│     get_element_by_prompt()                 │
+├─────────────────────────────────────────────┤
+│  输入：                                          │
+│  • 序列化的 LLM 表示（紧凑格式）               │
+│  • 用户意图描述                                 │
+│  • System Prompt 说明                         │
+│                                            │
+│  输出：                                          │
+│  • element_highlight_index (数字索引)          │
+│  • 或 None（未找到匹配）                      │
+└─────────────────────────────────────────────┘
+```
+
+### 阶段 4：动作执行与验证
+```
+┌─────────────────────────────────────────────┐
+│     Tools / BrowserSession                  │
+├─────────────────────────────────────────────┤
+│  1. selector_map[index] → EnhancedDOMTreeNode │
+│  2. 提取 backend_node_id                     │
+│  3. CDP 执行操作（click/input/upload）        │
+│  4. multi_act 验证：                         │
+│     ├─ URL 是否变化？                         │
+│     ├─ Focus 是否变化？                       │
+│     └─ 页面状态是否异常？                     │
+└─────────────────────────────────────────────┘
+```
+
+---
+
+## 关键概念解释
+
+### 🏷️ 为什么用"索引"而不是"HTML id"？
+
+| HTML id | 数字索引 |
+|---------|----------|
+| 可能不稳定 | 序列化时稳定生成 |
+| 可能含特殊字符 | 纯数字，易于处理 |
+| 并非所有元素都有 | 所有可交互元素都有 |
+| 需解析 DOM 获取 | selector_map 直接映射 |
+
+### 🔍 LLM 如何判断匹配元素？
+
+**输入给 LLM 的紧凑表示示例：**
+```
+[1]<button aria-label='Search'>🔍</button>
+[2]<input placeholder='搜索内容' />
+[3]<a href='#contact'>联系</a>
+```
+
+**匹配要素：**
+- ✅ tag 名称（button/input/a）
+- ✅ 可访问名（aria-label）
+- ✅ 关键文本（placeholder、content）
+- ✅ 属性摘要（href、type）
+
+### 🛡️ 鲁棒性保障机制
+
+| 机制 | 作用 |
+|------|------|
+| **multi_act 中断** | 页面变化时立即停止后续动作，避免操作过时 DOM |
+| **智能回退** | index 找不到时尝试：CDP describeNode → 坐标查找 → 启发式搜索 |
+| **可见性验证** | paint-order 和 bbox 过滤确保元素可见且可交互 |
+
+---
+
+## 代码速查表
+
+```
+浏览器使用：https://github.com/browser-use/browser-use
+
+┌─────────────────────────────────────────────────────┐
+│ 核心文件                                            │
+├─────────────────────────────────────────────────────┤
+│ browser_use/dom/service.py                          │
+│   └─ DomService.get_dom_tree()                      │
+│                                                    │
+│ browser_use/dom/serializer/serializer.py            │
+│   └─ serialize_accessible_elements()                 │
+│                                                    │
+│ browser_use/dom/serializer/eval_serializer.py       │
+│   └─ DOMEvalSerializer (LLM 格式)                    │
+│                                                    │
+│ browser_use/dom/serializer/clickable_elements.py    │
+│   └─ ClickableElementDetector                       │
+│                                                    │
+│ browser_use/actor/page.py                           │
+│   └─ get_element_by_prompt()                        │
+│                                                    │
+│ browser_use/tools/service.py                        │
+│   └─ 工具执行与 CDP 调用                             │
+│                                                    │
+│ browser_use/browser/session.py                      │
+│   └─ 浏览器会话管理                                 │
+└─────────────────────────────────────────────────────┘
+```
+
+---
+
+## 完整示例演示
+
+```
+用户提示："点击搜索按钮"
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+序列化输出给 LLM：
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[1]<button aria-label='Search'>🔍</button>
+[2]<input placeholder='搜索内容' />
+[3]<a href='#contact'>联系</a>
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+LLM 推理过程：
+  • 用户意图："搜索"
+  • 匹配元素：[1] 的 aria-label='Search'
+  • 返回索引：1
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+执行流程：
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+selector_map[1] → EnhancedDOMTreeNode
+              → backend_node_id = 12345
+              → CDP.click(node_id=12345)
+              → multi_act 验证页面状态
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+---
+
+## 设计亮点总结
+
+1. **🎯 智能过滤**：paint-order、bbox、可交互性三重过滤
+2. **🔢 稳定索引**：连续数字索引，不受 DOM 变化影响
+3. **📦 紧凑表示**：节省 token，聚焦关键信息
+4. **🛡️ 执行验证**：multi_act 防止过时 DOM 操作
+5. **🔄 智能回退**：多层策略确保动作成功
+
+---
+
+## 下一步探索
+
+如需深入理解，可查看以下源码：
+1. `serializer._assign_interactive_indices_and_mark_new_nodes` - selector_map 构造细节
+2. `DOMEvalSerializer` 输出格式示例 - 实际 LLM 输入格式
+3. `actor/page.py` system prompt - LLM 提示模板
+4. `tools` 点击执行流程 - backend_node_id 获取与 CDP 调用
